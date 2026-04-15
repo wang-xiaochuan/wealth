@@ -629,7 +629,30 @@ def main():
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "--test":
-        send_ntfy("✅ 推送测试成功！ntfy 配置正常。", title="BTC 信号系统 - 测试")
+        # 测试模式：获取真实数据发送简要报告
+        df = get_klines(SYMBOL, None, LIMIT)
+        df = compute_indicators(df)
+        funding_rate = get_funding_rate()
+        ls_ratio = get_long_short_ratio()
+        sig = check_signal(df, funding_rate, ls_ratio)
+        price = sig["price"]
+
+        score_lines = "\n".join([
+            f"  {'✅' if v[2] else '❌'} {k}：{v[0]}/{v[1]}"
+            for k, v in sig["scores"].items()
+        ])
+
+        state = read_state()
+        status = "空仓等待中" if state is None else f"持仓中（入场价 ${state['entry_price']:,.1f}）"
+
+        msg = (
+            f"当前价：${price:,.1f}\n"
+            f"状态：{status}\n\n"
+            f"信号评分：{sig['score']}/{sig['score_max']}（阈值 {sig['threshold']}）\n"
+            f"{score_lines}\n\n"
+            f"{'⚠️ 目前无入场信号' if not sig['entry_signal'] else '🟢 有入场信号！'}"
+        )
+        send_ntfy(msg, title=f"BTC ${price:,.0f} · {status}")
         print("✅ 测试推送已发送")
     else:
         main()
