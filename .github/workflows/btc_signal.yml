@@ -29,11 +29,7 @@ jobs:
 
       - name: Run BTC signal check
         env:
-          EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
-          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-          EMAIL_TO: ${{ secrets.EMAIL_TO }}
-          SMTP_SERVER: ${{ secrets.SMTP_SERVER || 'smtp.gmail.com' }}
-          SMTP_PORT: ${{ secrets.SMTP_PORT || '587' }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
         run: python btc_signal.py
 
       - name: Persist state to repo

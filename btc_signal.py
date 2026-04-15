@@ -1,8 +1,5 @@
 import os
 import json
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 import requests
 import pandas as pd
 from datetime import datetime
@@ -10,11 +7,7 @@ from datetime import datetime
 # ─────────────────────────────────────────
 # 配置
 # ─────────────────────────────────────────
-EMAIL_ADDRESS = os.environ["EMAIL_ADDRESS"]       # 发件邮箱（Gmail）
-EMAIL_PASSWORD = os.environ["EMAIL_PASSWORD"]      # Gmail 应用专用密码
-EMAIL_TO = os.environ.get("EMAIL_TO", EMAIL_ADDRESS)  # 收件邮箱（默认发给自己）
-SMTP_SERVER = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
-SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+NTFY_TOPIC = os.environ["NTFY_TOPIC"]  # ntfy.sh 主题名（如 btc-signal-abc123）
 SYMBOL = "BTCUSDT"
 INTERVAL = "1h"
 LIMIT = 250
@@ -384,28 +377,21 @@ def interpret_oi(change_pct):
 
 
 # ─────────────────────────────────────────
-# 8. 邮件通知
+# 8. ntfy.sh 推送通知
 # ─────────────────────────────────────────
-def send_email(msg, subject="BTC 信号通知"):
-    email = MIMEMultipart("alternative")
-    email["From"] = EMAIL_ADDRESS
-    email["To"] = EMAIL_TO
-    email["Subject"] = subject
+def send_ntfy(msg, title="BTC 信号通知"):
+    # 去掉 HTML 标签，ntfy 用纯文本
+    import re
+    clean = re.sub(r"<[^>]+>", "", msg)
 
-    # 把消息中的换行转为 <br>，保留已有的 HTML 标签
-    html_body = f"""<html><body>
-<pre style="font-family: 'Segoe UI', Arial, sans-serif; font-size: 14px; line-height: 1.6;">
-{msg}
-</pre>
-</body></html>"""
-
-    email.attach(MIMEText(html_body, "html", "utf-8"))
-
-    with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
-        server.starttls()
-        server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
-        server.sendmail(EMAIL_ADDRESS, EMAIL_TO, email.as_string())
-    print("✅ 邮件已发送")
+    r = requests.post(
+        f"https://ntfy.sh/{NTFY_TOPIC}",
+        data=clean.encode("utf-8"),
+        headers={"Title": title, "Priority": "high"},
+        timeout=10,
+    )
+    r.raise_for_status()
+    print("✅ ntfy 已推送")
 
 
 # ─────────────────────────────────────────
@@ -487,7 +473,7 @@ def main():
                 f"  建议仓位：账户 30%\n"
                 f"  仅供参考，请自行判断"
             )
-            send_email(msg, subject=f"🟢 BTC 入场提醒 ${price:,.0f}")
+            send_ntfy(msg, title=f"🟢 BTC 入场提醒 ${price:,.0f}")
 
         elif sig["tech_signal"] and not sig["funding_ok"]:
             msg = (
@@ -501,7 +487,7 @@ def main():
                 f"{sentiment_block}\n\n"
                 f"等待资金费率回落至 +0.05% 以下"
             )
-            send_email(msg, subject=f"⏸ BTC 信号被情绪过滤 ${price:,.0f}")
+            send_ntfy(msg, title=f"⏸ BTC 信号被情绪过滤 ${price:,.0f}")
 
         else:
             if now_cst_h == 9:
@@ -521,7 +507,7 @@ def main():
                     f"{score_lines}"
                     f"{sentiment_block}"
                 )
-                send_email(msg, subject=f"📋 BTC 系统正常 ${price:,.0f}")
+                send_ntfy(msg, title=f"📋 BTC 系统正常 ${price:,.0f}")
             else:
                 print("无信号，静默")
 
@@ -585,7 +571,7 @@ def main():
                 f"{sentiment_block}\n\n"
                 f"⚠️ 请自行决定是否出场"
             )
-            send_email(msg, subject=f"{exit_emoji} BTC 出场提醒 {pnl_pct:+.2f}%")
+            send_ntfy(msg, title=f"{exit_emoji} BTC 出场提醒 {pnl_pct:+.2f}%")
             write_state(None)
 
         else:
@@ -619,7 +605,7 @@ def main():
                     f"{trail_line}"
                     f"{sentiment_block}"
                 )
-                send_email(msg, subject=f"📈 BTC 持仓更新 {pnl_pct:+.2f}%")
+                send_ntfy(msg, title=f"📈 BTC 持仓更新 {pnl_pct:+.2f}%")
                 print("📈 持仓更新已发送")
             else:
                 trail_status = f"移动止损@{trailing_stop:.1f}" if trailing_active else "移动止损未激活"
