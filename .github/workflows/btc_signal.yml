@@ -4,7 +4,12 @@ on:
   schedule:
     # 每小时第5分钟运行（避开整点高峰）
     - cron: '5 * * * *'
-  workflow_dispatch:  # 支持手动触发
+  workflow_dispatch:
+    inputs:
+      test_mode:
+        description: '发送测试推送（验证 ntfy 配置）'
+        type: boolean
+        default: false
 
 permissions:
   contents: write  # 需要写权限来提交 state.json
@@ -30,7 +35,12 @@ jobs:
       - name: Run BTC signal check
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-        run: python btc_signal.py
+        run: |
+          if [ "${{ github.event.inputs.test_mode }}" = "true" ]; then
+            python btc_signal.py --test
+          else
+            python btc_signal.py
+          fi
 
       - name: Persist state to repo
         run: |

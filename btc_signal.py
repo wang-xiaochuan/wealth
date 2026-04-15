@@ -628,4 +628,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "--test":
+        send_ntfy("✅ 推送测试成功！ntfy 配置正常。", title="BTC 信号系统 - 测试")
+        print("✅ 测试推送已发送")
+    else:
+        main()
