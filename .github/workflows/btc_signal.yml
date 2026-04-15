@@ -1,0 +1,53 @@
+name: BTC Signal Check
+
+on:
+  schedule:
+    # 每小时第5分钟运行（避开整点高峰）
+    - cron: '5 * * * *'
+  workflow_dispatch:  # 支持手动触发
+
+permissions:
+  contents: write  # 需要写权限来提交 state.json
+
+jobs:
+  check-signal:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          # 使用 token 以便后续 push 能触发
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run BTC signal check
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python btc_signal.py
+
+      - name: Persist state to repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # 只在 state.json 有变化时才提交
+          if git diff --quiet -- state.json 2>/dev/null && ! git ls-files --error-unmatch state.json 2>/dev/null; then
+            # state.json 是新文件（untracked）
+            git add state.json
+            git commit -m "bot: update position state"
+            git push
+          elif ! git diff --quiet -- state.json 2>/dev/null; then
+            # state.json 已存在且有变化
+            git add state.json
+            git commit -m "bot: update position state"
+            git push
+          else
+            echo "No state change, skip commit"
+          fi
