@@ -1,38 +1,38 @@
 import os
 import json
+import re
+import sys
 import requests
 import pandas as pd
 from datetime import datetime
 
 # ─────────────────────────────────────────
-# 配置
+# Config
 # ─────────────────────────────────────────
-NTFY_TOPIC = os.environ["NTFY_TOPIC"]  # ntfy.sh 主题名（如 btc-signal-abc123）
+NTFY_TOPIC = os.environ["NTFY_TOPIC"]
 SYMBOL = "BTCUSDT"
 LIMIT = 250
 
-# ATR 参数
+# ATR params
 ATR_PERIOD = 14
-ATR_STOP_MULT = 2.0        # 初始止损 = 入场价 - ATR × 2.0
-ATR_TRAIL_MULT = 1.5        # 移动止损距离 = ATR × 1.5
-TRAIL_ACTIVATE_PCT = 0.015  # 盈利达到 +1.5% 后激活移动止损
-TAKE_PROFIT_MULT = 4.0      # 止盈目标 = 入场价 + ATR × 4.0
+ATR_STOP_MULT = 2.0
+ATR_TRAIL_MULT = 1.5
+TRAIL_ACTIVATE_PCT = 0.015
+TAKE_PROFIT_MULT = 4.0
 
-# 止损/止盈的安全上下限（防止 ATR 异常时设出离谱的值）
-STOP_MIN_PCT = 0.01         # 止损最小 -1%
-STOP_MAX_PCT = 0.04         # 止损最大 -4%
-TARGET_MIN_PCT = 0.02       # 止盈最小 +2%
-TARGET_MAX_PCT = 0.06       # 止盈最大 +6%
+# Stop-loss / take-profit safety bounds
+STOP_MIN_PCT = 0.01
+STOP_MAX_PCT = 0.04
+TARGET_MIN_PCT = 0.02
+TARGET_MAX_PCT = 0.06
 
 
 # ─────────────────────────────────────────
-# 1. K 线（CryptoCompare — 不限制云 IP）
+# 1. Klines (CryptoCompare)
 # ─────────────────────────────────────────
-def get_klines(symbol, interval, limit):
+def get_klines():
     url = "https://min-api.cryptocompare.com/data/v2/histohour"
-    r = requests.get(url, params={
-        "fsym": "BTC", "tsym": "USDT", "limit": limit,
-    }, timeout=10)
+    r = requests.get(url, params={"fsym": "BTC", "tsym": "USDT", "limit": LIMIT}, timeout=10)
     r.raise_for_status()
     data = r.json()["Data"]["Data"]
     df = pd.DataFrame(data)
@@ -43,7 +43,7 @@ def get_klines(symbol, interval, limit):
 
 
 # ─────────────────────────────────────────
-# 2. 合约情绪（Bybit）
+# 2. Derivatives sentiment (Bybit, optional)
 # ─────────────────────────────────────────
 def get_funding_rate():
     try:
@@ -53,10 +53,9 @@ def get_funding_rate():
         data = r.json()["result"]["list"]
         if data:
             return float(data[0]["fundingRate"])
-        return None
     except Exception as e:
-        print(f"资金费率获取失败: {e}")
-        return None
+        print(f"Funding rate fetch failed: {e}")
+    return None
 
 
 def get_long_short_ratio():
@@ -68,10 +67,9 @@ def get_long_short_ratio():
         data = r.json()["result"]["list"]
         if data:
             return float(data[0]["buyRatio"]) / float(data[0]["sellRatio"])
-        return None
     except Exception as e:
-        print(f"多空比获取失败: {e}")
-        return None
+        print(f"Long/short ratio fetch failed: {e}")
+    return None
 
 
 def get_open_interest_change():
@@ -82,10 +80,8 @@ def get_open_interest_change():
         r.raise_for_status()
         data = r.json()["result"]["list"]
         if len(data) >= 2:
-            # Bybit 返回倒序（最新在前）
             latest = float(data[0]["openInterest"])
             oldest = float(data[-1]["openInterest"])
-            # 需要用价格换算为 USD 价值（近似）
             price_r = requests.get("https://api.bybit.com/v5/market/tickers",
                                    params={"category": "linear", "symbol": SYMBOL}, timeout=10)
             price_r.raise_for_status()
@@ -94,34 +90,27 @@ def get_open_interest_change():
             oldest_val = oldest * price
             change_pct = round((latest_val - oldest_val) / oldest_val * 100, 2)
             return change_pct, round(latest_val / 1e8, 2)
-        return None, None
     except Exception as e:
-        print(f"持仓量获取失败: {e}")
-        return None, None
+        print(f"Open interest fetch failed: {e}")
+    return None, None
 
 
 # ─────────────────────────────────────────
-# 3. 技术指标（含 ATR）
+# 3. Technical indicators
 # ─────────────────────────────────────────
 def compute_indicators(df):
-    # 趋势
     df["ma200"] = df["close"].rolling(200).mean()
     df["ma50"] = df["close"].rolling(50).mean()
 
-    # RSI
     delta = df["close"].diff()
     gain = delta.clip(lower=0).rolling(14).mean()
     loss = (-delta.clip(upper=0)).rolling(14).mean()
     df["rsi"] = 100 - (100 / (1 + gain / loss))
 
-    # 成交量
     df["vol_ma20"] = df["volume"].rolling(20).mean()
-
-    # 近期结构
     df["recent_high_40"] = df["high"].rolling(40).max()
     df["recent_low_40"] = df["low"].rolling(40).min()
 
-    # ATR（True Range 的移动平均）
     df["prev_close"] = df["close"].shift(1)
     df["tr"] = pd.concat([
         df["high"] - df["low"],
@@ -134,34 +123,39 @@ def compute_indicators(df):
 
 
 # ─────────────────────────────────────────
-# 4. 动态止损 / 止盈计算
+# 4. Dynamic stop-loss / take-profit
 # ─────────────────────────────────────────
 def calc_dynamic_levels(entry_price, atr):
-    """根据入场价和当时 ATR 计算初始止损和止盈"""
     raw_stop = entry_price - atr * ATR_STOP_MULT
     raw_target = entry_price + atr * TAKE_PROFIT_MULT
 
-    # 安全上下限
     stop = max(raw_stop, entry_price * (1 - STOP_MAX_PCT))
     stop = min(stop, entry_price * (1 - STOP_MIN_PCT))
-
     target = max(raw_target, entry_price * (1 + TARGET_MIN_PCT))
     target = min(target, entry_price * (1 + TARGET_MAX_PCT))
 
     stop_pct = (stop / entry_price - 1) * 100
     target_pct = (target / entry_price - 1) * 100
-
     return round(stop, 1), round(target, 1), round(stop_pct, 2), round(target_pct, 2)
 
 
 def calc_trailing_stop(highest_price, atr):
-    """移动止损位 = 最高价 - ATR × 1.5"""
     return round(highest_price - atr * ATR_TRAIL_MULT, 1)
 
 
 # ─────────────────────────────────────────
-# 5. 信号判断
+# 5. Signal scoring
 # ─────────────────────────────────────────
+SCORE_LABELS = {
+    "Trend MA200": None,
+    "MA50 Slope": None,
+    "RSI Momentum": None,
+    "Volume": None,
+    "Position": None,
+    "Support": None,
+}
+
+
 def check_signal(df, funding_rate, ls_ratio):
     last = df.iloc[-1]
     prev3 = df.iloc[-4]
@@ -176,28 +170,17 @@ def check_signal(df, funding_rate, ls_ratio):
     recent_low = last["recent_low_40"]
     atr = last["atr"]
 
-    # ══ 加权评分系统 ══════════════════════
-    #
-    # 权重设计原则：
-    #   趋势是前提（最高权重），动量次之，辅助条件补充
-    #   满分 11.0，入场阈值 6.5
-    #   部分满足给半分，避免"差一个条件全军覆没"
-    #
     score = 0.0
     scores = {}
 
-    # ── 1. 中期趋势：价格在 MA200 之上 ─────────── 权重 3.0
-    if price > ma200:
-        s = 3.0
-    else:
-        s = 0.0
+    # 1. Trend: price above MA200 — weight 3.0
+    s = 3.0 if price > ma200 else 0.0
     score += s
-    scores["趋势MA200"] = (s, 3.0, price > ma200)
+    scores["Trend MA200"] = (s, 3.0, price > ma200)
 
-    # ── 2. 短期趋势：MA50 向上倾斜 ─────────────── 权重 1.5
+    # 2. MA50 slope — weight 1.5
     ma50_now = last["ma50"]
     ma50_4ago = df.iloc[-4]["ma50"]
-
     if ma50_now > ma50_4ago:
         s = 1.5
     elif ma50_now > df.iloc[-8]["ma50"]:
@@ -205,21 +188,21 @@ def check_signal(df, funding_rate, ls_ratio):
     else:
         s = 0.0
     score += s
-    scores["MA50斜率"] = (s, 1.5, s > 0)
+    scores["MA50 Slope"] = (s, 1.5, s > 0)
 
-    # ── 3. RSI 动量：从超卖区回升 ───────────────── 权重 2.5
+    # 3. RSI momentum — weight 2.5
     if rsi_3ago < 38 and rsi_now > 44:
         s = 2.5
     elif rsi_3ago < 45 and rsi_now > 44:
         s = 1.0
-    elif rsi_now > 50 and rsi_now < 65:
+    elif 50 < rsi_now < 65:
         s = 0.5
     else:
         s = 0.0
     score += s
-    scores["RSI动量"] = (s, 2.5, s >= 1.0)
+    scores["RSI Momentum"] = (s, 2.5, s >= 1.0)
 
-    # ── 4. 成交量确认 ───────────────────────────── 权重 2.0
+    # 4. Volume confirmation — weight 2.0
     vol_ratio = vol_now / vol_ma
     if vol_ratio >= 1.3:
         s = 2.0
@@ -228,9 +211,9 @@ def check_signal(df, funding_rate, ls_ratio):
     else:
         s = 0.0
     score += s
-    scores["成交量"] = (s, 2.0, s >= 1.0)
+    scores["Volume"] = (s, 2.0, s >= 1.0)
 
-    # ── 5. 位置合理：不追高 ─────────────────────── 权重 1.5
+    # 5. Not chasing highs — weight 1.5
     dist_from_high = (price / recent_high - 1) * 100
     if dist_from_high < -5:
         s = 1.5
@@ -239,46 +222,38 @@ def check_signal(df, funding_rate, ls_ratio):
     else:
         s = 0.0
     score += s
-    scores["位置"] = (s, 1.5, s > 0)
+    scores["Position"] = (s, 1.5, s > 0)
 
-    # ── 6. 接近支撑（加分项）─────────────────────  权重 0.5
+    # 6. Near support — weight 0.5
     dist_from_low = (price / recent_low - 1) * 100
-    if dist_from_low < 4:
-        s = 0.5
-    else:
-        s = 0.0
+    s = 0.5 if dist_from_low < 4 else 0.0
     score += s
-    scores["支撑位"] = (s, 0.5, s > 0)
+    scores["Support"] = (s, 0.5, s > 0)
 
     score = round(score, 1)
 
-    # ── 信号强度等级 ─────────────────────────────
+    # Signal strength
     if score >= 9.5:
-        strength = "极强"
-        strength_short = "极强"
+        strength = "Very Strong"
     elif score >= 8.0:
-        strength = "较强"
-        strength_short = "较强"
+        strength = "Strong"
     elif score >= 6.5:
-        strength = "一般"
-        strength_short = "一般"
+        strength = "Moderate"
     else:
-        strength = "弱"
-        strength_short = "弱"
+        strength = "Weak"
 
-    # ══ 硬性过滤（不参与评分，直接阻断）══════════
+    # Hard filters
     trend_ok = price > ma200
 
     funding_ok = True
     funding_block_reason = None
     if funding_rate is not None and funding_rate > 0.0008:
         funding_ok = False
-        funding_block_reason = f"资金费率过高 ({funding_rate*100:.3f}%)，多头拥挤"
+        funding_block_reason = f"Funding rate too high ({funding_rate*100:.3f}%), longs crowded"
 
     ENTRY_THRESHOLD = 6.5
     tech_signal = trend_ok and (score >= ENTRY_THRESHOLD)
     entry_signal = tech_signal and funding_ok
-
     ls_warning = ls_ratio is not None and ls_ratio > 1.6
 
     return {
@@ -295,7 +270,6 @@ def check_signal(df, funding_rate, ls_ratio):
         "score_max": 11.0,
         "threshold": ENTRY_THRESHOLD,
         "strength": strength,
-        "strength_short": strength_short,
         "scores": scores,
         "entry_signal": entry_signal,
         "tech_signal": tech_signal,
@@ -308,17 +282,12 @@ def check_signal(df, funding_rate, ls_ratio):
 
 
 # ─────────────────────────────────────────
-# 6. 持仓状态（JSON 格式）
+# 6. Position state (JSON)
 # ─────────────────────────────────────────
 STATE_FILE = "state.json"
 
 
 def read_state():
-    """
-    返回 dict 或 None（空仓）
-    字段：entry_price, initial_stop, take_profit, atr,
-          highest, trailing_stop, trailing_active
-    """
     if os.path.exists(STATE_FILE):
         content = open(STATE_FILE).read().strip()
         if content and content != "NONE":
@@ -345,80 +314,78 @@ def write_state(state_dict):
 
 
 # ─────────────────────────────────────────
-# 7. 情绪解读
+# 7. Sentiment interpretation
 # ─────────────────────────────────────────
 def interpret_funding(rate):
     if rate is None:
-        return "获取失败", "neutral"
+        return "N/A", "neutral"
     pct = rate * 100
     if pct > 0.08:
-        return f"+{pct:.3f}% 多头极度拥挤", "overheated"
+        return f"+{pct:.3f}% Overheated", "overheated"
     elif pct > 0.03:
-        return f"+{pct:.3f}% 多头偏热", "warm"
+        return f"+{pct:.3f}% Warm", "warm"
     elif pct > -0.01:
-        return f"{pct:+.3f}% 中性", "neutral"
+        return f"{pct:+.3f}% Neutral", "neutral"
     elif pct > -0.05:
-        return f"{pct:+.3f}% 空头偏多", "cool"
+        return f"{pct:+.3f}% Cool", "cool"
     else:
-        return f"{pct:+.3f}% 空头极度拥挤", "cold"
+        return f"{pct:+.3f}% Cold", "cold"
 
 
 def interpret_ls(ratio):
     if ratio is None:
-        return "获取失败"
+        return "N/A"
     if ratio > 1.5:
-        return f"{ratio:.2f} 散户严重偏多（反向信号）"
+        return f"{ratio:.2f} Retail heavily long (contrarian)"
     elif ratio > 1.1:
-        return f"{ratio:.2f} 多头略占优"
+        return f"{ratio:.2f} Slightly long"
     elif ratio > 0.9:
-        return f"{ratio:.2f} 多空均衡"
+        return f"{ratio:.2f} Balanced"
     elif ratio > 0.7:
-        return f"{ratio:.2f} 空头略占优"
+        return f"{ratio:.2f} Slightly short"
     else:
-        return f"{ratio:.2f} 散户严重偏空（潜在反弹）"
+        return f"{ratio:.2f} Retail heavily short (bounce possible)"
 
 
 def interpret_oi(change_pct):
     if change_pct is None:
-        return "获取失败"
+        return "N/A"
     if change_pct > 3:
-        return f"+{change_pct}% 资金大量流入"
+        return f"+{change_pct}% Large inflow"
     elif change_pct > 0:
-        return f"+{change_pct}% 资金小幅流入"
+        return f"+{change_pct}% Small inflow"
     elif change_pct > -3:
-        return f"{change_pct}% 资金小幅撤离"
+        return f"{change_pct}% Small outflow"
     else:
-        return f"{change_pct}% 资金大量撤离"
+        return f"{change_pct}% Large outflow"
 
 
 # ─────────────────────────────────────────
-# 8. ntfy.sh 推送通知
+# 8. ntfy.sh push notification
 # ─────────────────────────────────────────
-def send_ntfy(msg, title="BTC 信号通知"):
-    # 去掉 HTML 标签，ntfy 用纯文本
-    import re
+def send_ntfy(msg, title="BTC Signal"):
     clean = re.sub(r"<[^>]+>", "", msg)
-
     r = requests.post(
-        f"https://ntfy.sh/{NTFY_TOPIC}",
+        "https://ntfy.sh/",
         json={"topic": NTFY_TOPIC, "title": title, "message": clean, "priority": 4},
+        headers={"Content-Type": "application/json; charset=utf-8"},
         timeout=10,
     )
     r.raise_for_status()
-    print("✅ ntfy 已推送")
+    print("Notification sent")
 
 
 # ─────────────────────────────────────────
-# 9. 主流程
+# 9. Main logic
 # ─────────────────────────────────────────
 def main():
     now_utc = datetime.utcnow()
     now_str = now_utc.strftime("%Y-%m-%d %H:%M UTC")
     now_cst_h = (now_utc.hour + 8) % 24
 
-    print(f"[{now_str}] 开始检查...")
+    print(f"[{now_str}] Checking...")
 
-    df = get_klines(SYMBOL, None, LIMIT)
+    df = get_klines()
     df = compute_indicators(df)
     funding_rate = get_funding_rate()
     ls_ratio = get_long_short_ratio()
@@ -433,29 +400,27 @@ def main():
     oi_text = interpret_oi(oi_change)
 
     sentiment_block = (
-        f"\n📊 <b>市场情绪</b>\n"
-        f"  资金费率：{funding_text}\n"
-        f"  多空比：{ls_text}\n"
-        f"  持仓量(4H)：{oi_text}"
-        + (f"（{oi_val}亿U）" if oi_val else "")
+        f"\nSentiment\n"
+        f"  Funding: {funding_text}\n"
+        f"  L/S Ratio: {ls_text}\n"
+        f"  OI (4H): {oi_text}"
+        + (f" ({oi_val}B)" if oi_val else "")
     )
 
-    print(f"价格:{price:.1f} ATR:{atr:.1f}({sig['atr_pct']}%) RSI:{sig['rsi']} 量比:{sig['vol_ratio']}")
-    print(f"评分:{sig['score']}/{sig['score_max']} 阈值:{sig['threshold']} 强度:{sig['strength_short']}")
-    print(f"分项:{ {k: f'{v[0]}/{v[1]}' for k, v in sig['scores'].items()} }")
-    print(f"持仓:{ json.dumps(state) if state else '空仓' }")
+    print(f"Price:{price:.1f} ATR:{atr:.1f}({sig['atr_pct']}%) RSI:{sig['rsi']} Vol:{sig['vol_ratio']}")
+    print(f"Score:{sig['score']}/{sig['score_max']} Threshold:{sig['threshold']} Strength:{sig['strength']}")
+    print(f"Details: { {k: f'{v[0]}/{v[1]}' for k, v in sig['scores'].items()} }")
+    print(f"Position: {json.dumps(state) if state else 'No position'}")
 
-    # ══ 空仓：检查入场 ════════════════════
+    # ══ No position: check entry ════════════
     if state is None:
         if sig["entry_signal"]:
             stop, target, stop_pct, target_pct = calc_dynamic_levels(price, atr)
             rr = round(abs(target_pct / stop_pct), 1)
-            dist_ma200 = round((price / sig["ma200"] - 1) * 100, 1)
-            dist_high = round((price / sig["recent_high"] - 1) * 100, 1)
-            ls_warn = "\n⚠️ 多空比偏高，注意散户情绪风险" if sig["ls_warning"] else ""
+            ls_warn = "\nL/S ratio high, watch retail sentiment risk" if sig["ls_warning"] else ""
 
             score_lines = "\n".join([
-                f"  {'✅' if v[2] else '❌'} {k}：{v[0]}/{v[1]}"
+                f"  {'[Y]' if v[2] else '[N]'} {k}: {v[0]}/{v[1]}"
                 for k, v in sig["scores"].items()
             ])
 
@@ -471,61 +436,60 @@ def main():
             write_state(new_state)
 
             msg = (
-                f"🟢 <b>BTC 入场提醒</b>\n"
-                f"{'─' * 22}\n"
-                f"  {now_str}（北京 {now_cst_h:02d}:xx）\n\n"
-                f"  当前价：<b>${price:,.1f}</b>\n\n"
-                f"  <b>信号评分：{sig['score']}/{sig['score_max']}  {sig['strength']}</b>\n"
+                f"ENTRY SIGNAL\n"
+                f"{'=' * 22}\n"
+                f"{now_str} (Beijing {now_cst_h:02d}:xx)\n\n"
+                f"Price: ${price:,.1f}\n\n"
+                f"Score: {sig['score']}/{sig['score_max']} - {sig['strength']}\n"
                 f"{score_lines}\n\n"
-                f"  <b>ATR 动态止损</b>（ATR={atr:.1f} / {sig['atr_pct']}%）\n"
-                f"  初始止损：<b>${stop:,}</b>（{stop_pct:.2f}%）\n"
-                f"  止盈目标：<b>${target:,}</b>（+{target_pct:.2f}%）\n"
-                f"  盈亏比：1 : {rr}\n"
-                f"  移动止损：盈利 +1.5% 后激活\n"
+                f"ATR Stop (ATR={atr:.1f} / {sig['atr_pct']}%)\n"
+                f"  Stop-loss: ${stop:,} ({stop_pct:.2f}%)\n"
+                f"  Take-profit: ${target:,} (+{target_pct:.2f}%)\n"
+                f"  Risk/Reward: 1:{rr}\n"
+                f"  Trailing stop: activates at +1.5%\n"
                 f"{sentiment_block}"
                 f"{ls_warn}\n\n"
-                f"  建议仓位：账户 30%\n"
-                f"  仅供参考，请自行判断"
+                f"Suggested position: 30% of account\n"
+                f"For reference only"
             )
-            send_ntfy(msg, title=f"🟢 BTC 入场提醒 ${price:,.0f}")
+            send_ntfy(msg, title=f"BTC ENTRY ${price:,.0f}")
 
         elif sig["tech_signal"] and not sig["funding_ok"]:
             msg = (
-                f"⏸ <b>BTC 信号被情绪过滤</b>\n"
-                f"{'─' * 22}\n"
-                f"  {now_str}\n\n"
-                f"技术条件：✅ 全部满足\n"
-                f"当前价：${price:,.1f}\n\n"
-                f"  <b>过滤原因</b>\n"
-                f"  {sig['funding_block_reason']}\n"
+                f"SIGNAL FILTERED\n"
+                f"{'=' * 22}\n"
+                f"{now_str}\n\n"
+                f"Technicals: ALL PASS\n"
+                f"Price: ${price:,.1f}\n\n"
+                f"Blocked by: {sig['funding_block_reason']}\n"
                 f"{sentiment_block}\n\n"
-                f"等待资金费率回落至 +0.05% 以下"
+                f"Waiting for funding rate to drop below +0.05%"
             )
-            send_ntfy(msg, title=f"⏸ BTC 信号被情绪过滤 ${price:,.0f}")
+            send_ntfy(msg, title=f"BTC FILTERED ${price:,.0f}")
 
         else:
             if now_cst_h == 9:
                 score_lines = "\n".join([
-                    f"  {'✅' if v[2] else '❌'} {k}：{v[0]}/{v[1]}"
+                    f"  {'[Y]' if v[2] else '[N]'} {k}: {v[0]}/{v[1]}"
                     for k, v in sig["scores"].items()
                 ])
                 msg = (
-                    f"📋 <b>BTC 系统运行正常</b>\n"
-                    f"{'─' * 22}\n"
-                    f"  {now_str}\n\n"
-                    f"状态：空仓等待\n"
-                    f"当前价：${price:,.1f}\n"
-                    f"ATR：{atr:.1f}（{sig['atr_pct']}%）\n\n"
-                    f"<b>当前评分：{sig['score']}/{sig['score_max']}  {sig['strength']}</b>\n"
-                    f"入场阈值：{sig['threshold']} 分\n"
+                    f"SYSTEM OK - Daily Report\n"
+                    f"{'=' * 22}\n"
+                    f"{now_str}\n\n"
+                    f"Status: No position, waiting\n"
+                    f"Price: ${price:,.1f}\n"
+                    f"ATR: {atr:.1f} ({sig['atr_pct']}%)\n\n"
+                    f"Score: {sig['score']}/{sig['score_max']} - {sig['strength']}\n"
+                    f"Entry threshold: {sig['threshold']}\n"
                     f"{score_lines}"
                     f"{sentiment_block}"
                 )
-                send_ntfy(msg, title=f"📋 BTC 系统正常 ${price:,.0f}")
+                send_ntfy(msg, title=f"BTC Daily ${price:,.0f}")
             else:
-                print("无信号，静默")
+                print("No signal, silent")
 
-    # ══ 持仓：更新移动止损 + 检查出场 ═════
+    # ══ Holding: update trailing stop + check exit ═════
     else:
         entry_price = state["entry_price"]
         initial_stop = state["initial_stop"] or entry_price * (1 - STOP_MIN_PCT)
@@ -537,100 +501,98 @@ def main():
 
         pnl_pct = (price - entry_price) / entry_price * 100
 
-        # ── 移动止损逻辑 ──────────────────────
+        # Trailing stop logic
         if not trailing_active and pnl_pct >= TRAIL_ACTIVATE_PCT * 100:
             trailing_active = True
             trailing_stop = calc_trailing_stop(highest, current_atr)
-            print(f"🔔 移动止损激活：最高价 {highest:.1f}，移动止损 {trailing_stop:.1f}")
+            print(f"Trailing stop activated: high {highest:.1f}, stop {trailing_stop:.1f}")
         elif trailing_active:
             new_trail = calc_trailing_stop(highest, current_atr)
             if trailing_stop is None or new_trail > trailing_stop:
                 trailing_stop = new_trail
 
-        # 更新状态
         state["highest"] = highest
         state["trailing_stop"] = trailing_stop
         state["trailing_active"] = trailing_active
         write_state(state)
 
-        # ── 出场判断 ──────────────────────────
+        # Exit check
         exit_reason = None
-        exit_emoji = "🔴"
+        exit_tag = "EXIT"
 
         if price >= take_profit:
-            exit_reason = f"达到止盈目标 +{(take_profit/entry_price-1)*100:.1f}%"
-            exit_emoji = "🎯"
+            exit_reason = f"Take-profit hit +{(take_profit/entry_price-1)*100:.1f}%"
+            exit_tag = "TARGET HIT"
         elif trailing_active and trailing_stop and price <= trailing_stop:
             locked_pct = (trailing_stop / entry_price - 1) * 100
-            exit_reason = f"移动止损触发（锁住 {locked_pct:+.2f}%）"
-            exit_emoji = "🔒"
+            exit_reason = f"Trailing stop triggered (locked {locked_pct:+.2f}%)"
+            exit_tag = "TRAILING STOP"
         elif price <= initial_stop:
-            exit_reason = f"触及初始止损（ATR×{ATR_STOP_MULT}）"
-            exit_emoji = "🔴"
+            exit_reason = f"Initial stop hit (ATR x{ATR_STOP_MULT})"
+            exit_tag = "STOP LOSS"
         elif sig["trend_broken"]:
-            exit_reason = "价格跌破 MA200，趋势破坏"
+            exit_reason = "Price below MA200, trend broken"
+            exit_tag = "TREND BREAK"
         elif sig["ma50_broken"] and pnl_pct < 0:
-            exit_reason = "跌破 MA50 且浮亏，建议减仓"
+            exit_reason = "Below MA50 with loss, consider reducing"
+            exit_tag = "MA50 BREAK"
 
         if exit_reason:
             msg = (
-                f"{exit_emoji} <b>BTC 出场提醒</b>\n"
-                f"{'─' * 22}\n"
-                f"  {now_str}\n\n"
-                f"当前价：<b>${price:,.1f}</b>\n"
-                f"入场价：${entry_price:,.1f}\n"
-                f"最高价：${highest:,.1f}\n"
-                f"盈亏：<b>{pnl_pct:+.2f}%</b>\n\n"
-                f"触发：{exit_reason}\n"
+                f"{exit_tag}\n"
+                f"{'=' * 22}\n"
+                f"{now_str}\n\n"
+                f"Price: ${price:,.1f}\n"
+                f"Entry: ${entry_price:,.1f}\n"
+                f"High: ${highest:,.1f}\n"
+                f"P&L: {pnl_pct:+.2f}%\n\n"
+                f"Trigger: {exit_reason}\n"
                 f"{sentiment_block}\n\n"
-                f"⚠️ 请自行决定是否出场"
+                f"Please decide whether to exit"
             )
-            send_ntfy(msg, title=f"{exit_emoji} BTC 出场提醒 {pnl_pct:+.2f}%")
+            send_ntfy(msg, title=f"BTC {exit_tag} {pnl_pct:+.2f}%")
             write_state(None)
 
         else:
-            # 每4小时发持仓更新
             if now_utc.hour % 4 == 0:
                 trail_line = ""
                 if trailing_active and trailing_stop:
                     trail_pct = round((trailing_stop / entry_price - 1) * 100, 2)
                     dist_trail = round((price / trailing_stop - 1) * 100, 1)
                     trail_line = (
-                        f"\n  移动止损：<b>${trailing_stop:,}</b>（{trail_pct:+.2f}%，"
-                        f"距当前 -{dist_trail}%）\n"
-                        f"  最高价：${highest:,.1f}"
+                        f"\n  Trailing stop: ${trailing_stop:,} ({trail_pct:+.2f}%, "
+                        f"{dist_trail}% from current)\n"
+                        f"  Highest: ${highest:,.1f}"
                     )
                 else:
                     activate_gap = round(TRAIL_ACTIVATE_PCT * 100 - pnl_pct, 2)
-                    trail_line = f"\n  移动止损：未激活（再涨 {activate_gap:.2f}% 激活）"
+                    trail_line = f"\n  Trailing stop: inactive (need +{activate_gap:.2f}% more)"
 
                 dist_target = round((take_profit / price - 1) * 100, 1)
                 dist_stop = round((price / initial_stop - 1) * 100, 1)
 
                 msg = (
-                    f"📈 <b>BTC 持仓更新</b>\n"
-                    f"{'─' * 22}\n"
-                    f"  {now_str}\n\n"
-                    f"入场价：${entry_price:,.1f}\n"
-                    f"当前价：${price:,.1f}\n"
-                    f"浮动盈亏：<b>{pnl_pct:+.2f}%</b>\n\n"
-                    f"止盈目标：${take_profit:,.1f}（还差 +{dist_target}%）\n"
-                    f"初始止损：${initial_stop:,.1f}（距当前 -{dist_stop}%）"
+                    f"POSITION UPDATE\n"
+                    f"{'=' * 22}\n"
+                    f"{now_str}\n\n"
+                    f"Entry: ${entry_price:,.1f}\n"
+                    f"Current: ${price:,.1f}\n"
+                    f"P&L: {pnl_pct:+.2f}%\n\n"
+                    f"Target: ${take_profit:,.1f} (+{dist_target}% away)\n"
+                    f"Stop: ${initial_stop:,.1f} ({dist_stop}% away)"
                     f"{trail_line}"
                     f"{sentiment_block}"
                 )
-                send_ntfy(msg, title=f"📈 BTC 持仓更新 {pnl_pct:+.2f}%")
-                print("📈 持仓更新已发送")
+                send_ntfy(msg, title=f"BTC Position {pnl_pct:+.2f}%")
+                print("Position update sent")
             else:
-                trail_status = f"移动止损@{trailing_stop:.1f}" if trailing_active else "移动止损未激活"
-                print(f"持仓中 {pnl_pct:+.2f}% | {trail_status} | 静默")
+                trail_status = f"trailing@{trailing_stop:.1f}" if trailing_active else "trailing inactive"
+                print(f"Holding {pnl_pct:+.2f}% | {trail_status} | silent")
 
 
 if __name__ == "__main__":
-    import sys
     if len(sys.argv) > 1 and sys.argv[1] == "--test":
-        # 测试模式：获取真实数据发送简要报告
-        df = get_klines(SYMBOL, None, LIMIT)
+        df = get_klines()
         df = compute_indicators(df)
         funding_rate = get_funding_rate()
         ls_ratio = get_long_short_ratio()
@@ -638,21 +600,21 @@ if __name__ == "__main__":
         price = sig["price"]
 
         score_lines = "\n".join([
-            f"  {'✅' if v[2] else '❌'} {k}：{v[0]}/{v[1]}"
+            f"  {'[Y]' if v[2] else '[N]'} {k}: {v[0]}/{v[1]}"
             for k, v in sig["scores"].items()
         ])
 
         state = read_state()
-        status = "空仓等待中" if state is None else f"持仓中（入场价 ${state['entry_price']:,.1f}）"
+        status = "No position" if state is None else f"Holding (entry ${state['entry_price']:,.1f})"
 
         msg = (
-            f"当前价：${price:,.1f}\n"
-            f"状态：{status}\n\n"
-            f"信号评分：{sig['score']}/{sig['score_max']}（阈值 {sig['threshold']}）\n"
+            f"Price: ${price:,.1f}\n"
+            f"Status: {status}\n\n"
+            f"Score: {sig['score']}/{sig['score_max']} (threshold {sig['threshold']})\n"
             f"{score_lines}\n\n"
-            f"{'⚠️ 目前无入场信号' if not sig['entry_signal'] else '🟢 有入场信号！'}"
+            f"{'No entry signal' if not sig['entry_signal'] else 'ENTRY SIGNAL ACTIVE!'}"
         )
-        send_ntfy(msg, title=f"BTC ${price:,.0f} · {status}")
-        print("✅ 测试推送已发送")
+        send_ntfy(msg, title=f"BTC ${price:,.0f} - {status}")
+        print("Test notification sent")
     else:
         main()
