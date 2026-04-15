@@ -9,8 +9,6 @@ from datetime import datetime
 # ─────────────────────────────────────────
 NTFY_TOPIC = os.environ["NTFY_TOPIC"]  # ntfy.sh 主题名（如 btc-signal-abc123）
 SYMBOL = "BTCUSDT"
-BYBIT_CATEGORY = "linear"  # Bybit 线性合约
-INTERVAL = "60"             # Bybit 用分钟数表示：60 = 1h
 LIMIT = 250
 
 # ATR 参数
@@ -28,21 +26,17 @@ TARGET_MAX_PCT = 0.06       # 止盈最大 +6%
 
 
 # ─────────────────────────────────────────
-# 1. K 线（Bybit）
+# 1. K 线（CryptoCompare — 不限制云 IP）
 # ─────────────────────────────────────────
 def get_klines(symbol, interval, limit):
-    url = "https://api.bybit.com/v5/market/kline"
+    url = "https://min-api.cryptocompare.com/data/v2/histohour"
     r = requests.get(url, params={
-        "category": BYBIT_CATEGORY, "symbol": symbol,
-        "interval": interval, "limit": limit,
+        "fsym": "BTC", "tsym": "USDT", "limit": limit,
     }, timeout=10)
     r.raise_for_status()
-    data = r.json()["result"]["list"]
-    # Bybit 返回倒序（最新在前），需要反转
-    data.reverse()
-    df = pd.DataFrame(data, columns=[
-        "open_time", "open", "high", "low", "close", "volume", "turnover"
-    ])
+    data = r.json()["Data"]["Data"]
+    df = pd.DataFrame(data)
+    df = df.rename(columns={"time": "open_time", "volumefrom": "volume"})
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = df[col].astype(float)
     return df
@@ -54,7 +48,7 @@ def get_klines(symbol, interval, limit):
 def get_funding_rate():
     try:
         r = requests.get("https://api.bybit.com/v5/market/tickers",
-                         params={"category": BYBIT_CATEGORY, "symbol": SYMBOL}, timeout=10)
+                         params={"category": "linear", "symbol": SYMBOL}, timeout=10)
         r.raise_for_status()
         data = r.json()["result"]["list"]
         if data:
@@ -68,7 +62,7 @@ def get_funding_rate():
 def get_long_short_ratio():
     try:
         r = requests.get("https://api.bybit.com/v5/market/account-ratio",
-                         params={"category": BYBIT_CATEGORY, "symbol": SYMBOL,
+                         params={"category": "linear", "symbol": SYMBOL,
                                  "period": "1h", "limit": 1}, timeout=10)
         r.raise_for_status()
         data = r.json()["result"]["list"]
@@ -83,7 +77,7 @@ def get_long_short_ratio():
 def get_open_interest_change():
     try:
         r = requests.get("https://api.bybit.com/v5/market/open-interest",
-                         params={"category": BYBIT_CATEGORY, "symbol": SYMBOL,
+                         params={"category": "linear", "symbol": SYMBOL,
                                  "intervalTime": "1h", "limit": 5}, timeout=10)
         r.raise_for_status()
         data = r.json()["result"]["list"]
@@ -93,7 +87,7 @@ def get_open_interest_change():
             oldest = float(data[-1]["openInterest"])
             # 需要用价格换算为 USD 价值（近似）
             price_r = requests.get("https://api.bybit.com/v5/market/tickers",
-                                   params={"category": BYBIT_CATEGORY, "symbol": SYMBOL}, timeout=10)
+                                   params={"category": "linear", "symbol": SYMBOL}, timeout=10)
             price_r.raise_for_status()
             price = float(price_r.json()["result"]["list"][0]["lastPrice"])
             latest_val = latest * price
