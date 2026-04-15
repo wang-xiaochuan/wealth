@@ -419,7 +419,7 @@ def main():
 
     print(f"[{now_str}] 开始检查...")
 
-    df = get_klines(SYMBOL, INTERVAL, LIMIT)
+    df = get_klines(SYMBOL, None, LIMIT)
     df = compute_indicators(df)
     funding_rate = get_funding_rate()
     ls_ratio = get_long_short_ratio()
