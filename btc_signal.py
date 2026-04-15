@@ -401,8 +401,7 @@ def send_ntfy(msg, title="BTC 信号通知"):
 
     r = requests.post(
         f"https://ntfy.sh/{NTFY_TOPIC}",
-        data=clean.encode("utf-8"),
-        headers={"Title": title, "Priority": "high"},
+        json={"topic": NTFY_TOPIC, "title": title, "message": clean, "priority": 4},
         timeout=10,
     )
     r.raise_for_status()
