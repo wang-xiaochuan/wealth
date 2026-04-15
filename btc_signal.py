@@ -9,7 +9,8 @@ from datetime import datetime
 # ─────────────────────────────────────────
 NTFY_TOPIC = os.environ["NTFY_TOPIC"]  # ntfy.sh 主题名（如 btc-signal-abc123）
 SYMBOL = "BTCUSDT"
-INTERVAL = "1h"
+BYBIT_CATEGORY = "linear"  # Bybit 线性合约
+INTERVAL = "60"             # Bybit 用分钟数表示：60 = 1h
 LIMIT = 250
 
 # ATR 参数
@@ -27,16 +28,20 @@ TARGET_MAX_PCT = 0.06       # 止盈最大 +6%
 
 
 # ─────────────────────────────────────────
-# 1. K 线
+# 1. K 线（Bybit）
 # ─────────────────────────────────────────
 def get_klines(symbol, interval, limit):
-    url = "https://api.binance.com/api/v3/klines"
-    r = requests.get(url, params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=10)
+    url = "https://api.bybit.com/v5/market/kline"
+    r = requests.get(url, params={
+        "category": BYBIT_CATEGORY, "symbol": symbol,
+        "interval": interval, "limit": limit,
+    }, timeout=10)
     r.raise_for_status()
-    df = pd.DataFrame(r.json(), columns=[
-        "open_time", "open", "high", "low", "close", "volume",
-        "close_time", "quote_volume", "trades",
-        "taker_buy_base", "taker_buy_quote", "ignore"
+    data = r.json()["result"]["list"]
+    # Bybit 返回倒序（最新在前），需要反转
+    data.reverse()
+    df = pd.DataFrame(data, columns=[
+        "open_time", "open", "high", "low", "close", "volume", "turnover"
     ])
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = df[col].astype(float)
@@ -44,14 +49,17 @@ def get_klines(symbol, interval, limit):
 
 
 # ─────────────────────────────────────────
-# 2. 合约情绪
+# 2. 合约情绪（Bybit）
 # ─────────────────────────────────────────
 def get_funding_rate():
     try:
-        r = requests.get("https://fapi.binance.com/fapi/v1/premiumIndex",
-                         params={"symbol": SYMBOL}, timeout=10)
+        r = requests.get("https://api.bybit.com/v5/market/tickers",
+                         params={"category": BYBIT_CATEGORY, "symbol": SYMBOL}, timeout=10)
         r.raise_for_status()
-        return float(r.json()["lastFundingRate"])
+        data = r.json()["result"]["list"]
+        if data:
+            return float(data[0]["fundingRate"])
+        return None
     except Exception as e:
         print(f"资金费率获取失败: {e}")
         return None
@@ -59,11 +67,14 @@ def get_funding_rate():
 
 def get_long_short_ratio():
     try:
-        r = requests.get("https://fapi.binance.com/futures/data/globalLongShortAccountRatio",
-                         params={"symbol": SYMBOL, "period": "1h", "limit": 1}, timeout=10)
+        r = requests.get("https://api.bybit.com/v5/market/account-ratio",
+                         params={"category": BYBIT_CATEGORY, "symbol": SYMBOL,
+                                 "period": "1h", "limit": 1}, timeout=10)
         r.raise_for_status()
-        data = r.json()
-        return float(data[0]["longShortRatio"]) if data else None
+        data = r.json()["result"]["list"]
+        if data:
+            return float(data[0]["buyRatio"]) / float(data[0]["sellRatio"])
+        return None
     except Exception as e:
         print(f"多空比获取失败: {e}")
         return None
@@ -71,14 +82,24 @@ def get_long_short_ratio():
 
 def get_open_interest_change():
     try:
-        r = requests.get("https://fapi.binance.com/futures/data/openInterestHist",
-                         params={"symbol": SYMBOL, "period": "1h", "limit": 5}, timeout=10)
+        r = requests.get("https://api.bybit.com/v5/market/open-interest",
+                         params={"category": BYBIT_CATEGORY, "symbol": SYMBOL,
+                                 "intervalTime": "1h", "limit": 5}, timeout=10)
         r.raise_for_status()
-        data = r.json()
+        data = r.json()["result"]["list"]
         if len(data) >= 2:
-            latest = float(data[-1]["sumOpenInterestValue"])
-            oldest = float(data[0]["sumOpenInterestValue"])
-            return round((latest - oldest) / oldest * 100, 2), round(latest / 1e8, 2)
+            # Bybit 返回倒序（最新在前）
+            latest = float(data[0]["openInterest"])
+            oldest = float(data[-1]["openInterest"])
+            # 需要用价格换算为 USD 价值（近似）
+            price_r = requests.get("https://api.bybit.com/v5/market/tickers",
+                                   params={"category": BYBIT_CATEGORY, "symbol": SYMBOL}, timeout=10)
+            price_r.raise_for_status()
+            price = float(price_r.json()["result"]["list"][0]["lastPrice"])
+            latest_val = latest * price
+            oldest_val = oldest * price
+            change_pct = round((latest_val - oldest_val) / oldest_val * 100, 2)
+            return change_pct, round(latest_val / 1e8, 2)
         return None, None
     except Exception as e:
         print(f"持仓量获取失败: {e}")
