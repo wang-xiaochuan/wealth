@@ -95,6 +95,20 @@ def get_open_interest_change():
     return None, None
 
 
+def get_fear_greed():
+    """Crypto Fear & Greed Index (0-100). Free, no API key, no IP restriction."""
+    try:
+        r = requests.get("https://api.alternative.me/fng/?limit=1", timeout=10)
+        r.raise_for_status()
+        data = r.json()["data"][0]
+        value = int(data["value"])
+        label = data["value_classification"]  # e.g. "Fear", "Greed", "Extreme Fear"
+        return value, label
+    except Exception as e:
+        print(f"Fear & Greed fetch failed: {e}")
+        return None, None
+
+
 # ─────────────────────────────────────────
 # 3. Technical indicators
 # ─────────────────────────────────────────
@@ -390,6 +404,7 @@ def main():
     funding_rate = get_funding_rate()
     ls_ratio = get_long_short_ratio()
     oi_change, oi_val = get_open_interest_change()
+    fng_value, fng_label = get_fear_greed()
     sig = check_signal(df, funding_rate, ls_ratio)
     price = sig["price"]
     atr = sig["atr"]
@@ -399,8 +414,10 @@ def main():
     ls_text = interpret_ls(ls_ratio)
     oi_text = interpret_oi(oi_change)
 
+    fng_text = f"{fng_value}/100 ({fng_label})" if fng_value is not None else "N/A"
     sentiment_block = (
         f"\nSentiment\n"
+        f"  Fear & Greed: {fng_text}\n"
         f"  Funding: {funding_text}\n"
         f"  L/S Ratio: {ls_text}\n"
         f"  OI (4H): {oi_text}"
@@ -468,26 +485,23 @@ def main():
             send_ntfy(msg, title=f"BTC FILTERED ${price:,.0f}")
 
         else:
-            if now_cst_h == 9:
-                score_lines = "\n".join([
-                    f"  {'[Y]' if v[2] else '[N]'} {k}: {v[0]}/{v[1]}"
-                    for k, v in sig["scores"].items()
-                ])
-                msg = (
-                    f"SYSTEM OK - Daily Report\n"
-                    f"{'=' * 22}\n"
-                    f"{now_str}\n\n"
-                    f"Status: No position, waiting\n"
-                    f"Price: ${price:,.1f}\n"
-                    f"ATR: {atr:.1f} ({sig['atr_pct']}%)\n\n"
-                    f"Score: {sig['score']}/{sig['score_max']} - {sig['strength']}\n"
-                    f"Entry threshold: {sig['threshold']}\n"
-                    f"{score_lines}"
-                    f"{sentiment_block}"
-                )
-                send_ntfy(msg, title=f"BTC Daily ${price:,.0f}")
-            else:
-                print("No signal, silent")
+            score_lines = "\n".join([
+                f"  {'[Y]' if v[2] else '[N]'} {k}: {v[0]}/{v[1]}"
+                for k, v in sig["scores"].items()
+            ])
+            msg = (
+                f"No signal\n"
+                f"{'=' * 22}\n"
+                f"{now_str}\n\n"
+                f"Status: No position, waiting\n"
+                f"Price: ${price:,.1f}\n"
+                f"ATR: {atr:.1f} ({sig['atr_pct']}%)\n\n"
+                f"Score: {sig['score']}/{sig['score_max']} - {sig['strength']}\n"
+                f"Entry threshold: {sig['threshold']}\n"
+                f"{score_lines}"
+                f"{sentiment_block}"
+            )
+            send_ntfy(msg, title=f"BTC ${price:,.0f} - No signal")
 
     # ══ Holding: update trailing stop + check exit ═════
     else:
@@ -554,40 +568,35 @@ def main():
             write_state(None)
 
         else:
-            if now_utc.hour % 4 == 0:
-                trail_line = ""
-                if trailing_active and trailing_stop:
-                    trail_pct = round((trailing_stop / entry_price - 1) * 100, 2)
-                    dist_trail = round((price / trailing_stop - 1) * 100, 1)
-                    trail_line = (
-                        f"\n  Trailing stop: ${trailing_stop:,} ({trail_pct:+.2f}%, "
-                        f"{dist_trail}% from current)\n"
-                        f"  Highest: ${highest:,.1f}"
-                    )
-                else:
-                    activate_gap = round(TRAIL_ACTIVATE_PCT * 100 - pnl_pct, 2)
-                    trail_line = f"\n  Trailing stop: inactive (need +{activate_gap:.2f}% more)"
-
-                dist_target = round((take_profit / price - 1) * 100, 1)
-                dist_stop = round((price / initial_stop - 1) * 100, 1)
-
-                msg = (
-                    f"POSITION UPDATE\n"
-                    f"{'=' * 22}\n"
-                    f"{now_str}\n\n"
-                    f"Entry: ${entry_price:,.1f}\n"
-                    f"Current: ${price:,.1f}\n"
-                    f"P&L: {pnl_pct:+.2f}%\n\n"
-                    f"Target: ${take_profit:,.1f} (+{dist_target}% away)\n"
-                    f"Stop: ${initial_stop:,.1f} ({dist_stop}% away)"
-                    f"{trail_line}"
-                    f"{sentiment_block}"
+            trail_line = ""
+            if trailing_active and trailing_stop:
+                trail_pct = round((trailing_stop / entry_price - 1) * 100, 2)
+                dist_trail = round((price / trailing_stop - 1) * 100, 1)
+                trail_line = (
+                    f"\n  Trailing stop: ${trailing_stop:,} ({trail_pct:+.2f}%, "
+                    f"{dist_trail}% from current)\n"
+                    f"  Highest: ${highest:,.1f}"
                 )
-                send_ntfy(msg, title=f"BTC Position {pnl_pct:+.2f}%")
-                print("Position update sent")
             else:
-                trail_status = f"trailing@{trailing_stop:.1f}" if trailing_active else "trailing inactive"
-                print(f"Holding {pnl_pct:+.2f}% | {trail_status} | silent")
+                activate_gap = round(TRAIL_ACTIVATE_PCT * 100 - pnl_pct, 2)
+                trail_line = f"\n  Trailing stop: inactive (need +{activate_gap:.2f}% more)"
+
+            dist_target = round((take_profit / price - 1) * 100, 1)
+            dist_stop = round((price / initial_stop - 1) * 100, 1)
+
+            msg = (
+                f"POSITION UPDATE\n"
+                f"{'=' * 22}\n"
+                f"{now_str}\n\n"
+                f"Entry: ${entry_price:,.1f}\n"
+                f"Current: ${price:,.1f}\n"
+                f"P&L: {pnl_pct:+.2f}%\n\n"
+                f"Target: ${take_profit:,.1f} (+{dist_target}% away)\n"
+                f"Stop: ${initial_stop:,.1f} ({dist_stop}% away)"
+                f"{trail_line}"
+                f"{sentiment_block}"
+            )
+            send_ntfy(msg, title=f"BTC Position {pnl_pct:+.2f}%")
 
 
 if __name__ == "__main__":
@@ -596,6 +605,7 @@ if __name__ == "__main__":
         df = compute_indicators(df)
         funding_rate = get_funding_rate()
         ls_ratio = get_long_short_ratio()
+        fng_value, fng_label = get_fear_greed()
         sig = check_signal(df, funding_rate, ls_ratio)
         price = sig["price"]
 
@@ -606,10 +616,12 @@ if __name__ == "__main__":
 
         state = read_state()
         status = "No position" if state is None else f"Holding (entry ${state['entry_price']:,.1f})"
+        fng_text = f"{fng_value}/100 ({fng_label})" if fng_value is not None else "N/A"
 
         msg = (
             f"Price: ${price:,.1f}\n"
-            f"Status: {status}\n\n"
+            f"Status: {status}\n"
+            f"Fear & Greed: {fng_text}\n\n"
             f"Score: {sig['score']}/{sig['score_max']} (threshold {sig['threshold']})\n"
             f"{score_lines}\n\n"
             f"{'No entry signal' if not sig['entry_signal'] else 'ENTRY SIGNAL ACTIVE!'}"
